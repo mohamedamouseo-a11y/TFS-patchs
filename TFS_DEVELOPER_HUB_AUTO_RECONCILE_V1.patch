@@ -1,0 +1,185 @@
+diff --git a/server/routes/developer-hub.ts b/server/routes/developer-hub.ts
+--- a/server/routes/developer-hub.ts
++++ b/server/routes/developer-hub.ts
+@@ -564,5 +564,13 @@
+   return { ahead: Number(aheadRaw || 0), behind: Number(behindRaw || 0) };
+ }
+ 
++async function changedPathsBetween(baseRef: string, headRef: string): Promise<string[]> {
++  const result = await git(["diff", "--name-only", "-z", `${baseRef}..${headRef}`]);
++  if (result.code !== 0) {
++    throw new Error(result.stderr || "Failed to inspect remote changes");
++  }
++  return parseNullSeparatedPaths(result.stdout).sort((a, b) => a.localeCompare(b));
++}
++
+ function sourceStateFingerprint(files: string[]): string {
+   const digest = createHash("sha256");
+@@ -620,8 +620,9 @@
+     let remoteHead: string | null = null;
+     let ahead = 0;
+     let behind = 0;
++    let remoteRef = "";
+     if (remoteExists) {
+-      const remoteRef = await fetchRemote(config, env);
++      remoteRef = await fetchRemote(config, env);
+       const remoteHeadResult = await git(["rev-parse", remoteRef], env);
+       remoteHead = remoteHeadResult.code === 0 ? remoteHeadResult.stdout.trim() : null;
+       ({ ahead, behind } = await aheadBehind(remoteRef));
+@@ -637,10 +638,21 @@
+     const secretFindings = safeFiles.flatMap(scanFileForSecrets);
+     const conflicts: string[] = [];
+     const warnings: string[] = [];
++    const remoteChangedFiles =
++      remoteExists && remoteRef && behind > 0 && ahead === 0
++        ? await changedPathsBetween("HEAD", remoteRef)
++        : [];
++    const remoteChangedSet = new Set(remoteChangedFiles);
++    const overlappingFiles = files.filter((file) => remoteChangedSet.has(file));
+ 
+     if (ahead > 0 && behind > 0) conflicts.push("Local and remote branches have diverged");
+     if (unsafeFiles.length) conflicts.push("Unsafe files are present in the working tree");
+     if (secretFindings.length) conflicts.push("Potential secrets were detected");
++    if (overlappingFiles.length) {
++      const shown = overlappingFiles.slice(0, 8).join(", ");
++      const suffix = overlappingFiles.length > 8 ? ` (+${overlappingFiles.length - 8} more)` : "";
++      conflicts.push(`Remote updates overlap local changes: ${shown}${suffix}`);
++    }
+     if (firstPushSnapshot && excludedFiles.length) {
+       warnings.push(`${excludedFiles.length} local-only backup/runtime paths will be excluded from the clean first push`);
+     }
+@@ -652,11 +664,21 @@
+     }
+ 
+     if (mode === "push") {
+-      if (behind > 0) conflicts.push("Remote branch is ahead; review Pull or Sync first");
++      if (behind > 0 && ahead === 0 && files.length && !overlappingFiles.length) {
++        warnings.push(
++          `Remote is ahead by ${behind} commit(s). Push will preserve local changes, fast-forward, restore them, then continue safely.`,
++        );
++      } else if (behind > 0 && ahead === 0 && !files.length) {
++        conflicts.push("Remote branch is ahead and there are no local changes to publish; review Pull or Sync first");
++      }
+       if (!files.length && ahead === 0) warnings.push("There are no local changes or commits to push");
+     }
+ 
+     if (mode === "sync") {
+-      if (behind > 0 && files.length) conflicts.push("Remote is ahead while local files are modified");
++      if (behind > 0 && ahead === 0 && files.length && !overlappingFiles.length) {
++        warnings.push(
++          `Remote is ahead by ${behind} commit(s). Sync will preserve ${files.length} local change(s), fast-forward, then restore them.`,
++        );
++      }
+       if (!remoteExists) warnings.push("Remote branch will be created on first Sync");
+     }
+@@ -733,6 +733,8 @@
+   fs.writeFileSync(path.join(root, "HEAD.txt"), head || "NO_HEAD");
+   fs.writeFileSync(path.join(root, "HEAD_REF.txt"), headRef || "DETACHED");
+   fs.writeFileSync(path.join(root, "files.json"), JSON.stringify(files, null, 2));
++  const deletedFiles = files.filter((file) => !fs.existsSync(path.join(SOURCE_ROOT, file)));
++  fs.writeFileSync(path.join(root, "deleted-files.json"), JSON.stringify(deletedFiles, null, 2));
+   if (files.length) {
+     const list = path.join(root, "file-list.bin");
+     const existing = files.filter((file) => fs.existsSync(path.join(SOURCE_ROOT, file)));
+@@ -757,6 +759,56 @@
+     const restore = await runCommand("tar", ["-xzf", archive, "-C", SOURCE_ROOT], { cwd: SOURCE_ROOT });
+     if (restore.code !== 0) throw new Error(restore.stderr || "Rollback restore failed");
+   }
++  const deletedManifest = path.join(backupRoot, "deleted-files.json");
++  if (fs.existsSync(deletedManifest)) {
++    const deletedFiles = JSON.parse(fs.readFileSync(deletedManifest, "utf8")) as string[];
++    const sourceRoot = path.resolve(SOURCE_ROOT);
++    const sourcePrefix = `${sourceRoot}${path.sep}`;
++    for (const relativePath of deletedFiles) {
++      const fullPath = path.resolve(SOURCE_ROOT, relativePath);
++      if (fullPath === sourceRoot || !fullPath.startsWith(sourcePrefix)) {
++        throw new Error(`Unsafe rollback path rejected: ${relativePath}`);
++      }
++      fs.rmSync(fullPath, { recursive: true, force: true });
++    }
++  }
+ }
+ 
++async function createTemporaryReconcileStash(
++  operationId: string,
++  env: NodeJS.ProcessEnv,
++): Promise<string> {
++  const before = await git(["rev-parse", "-q", "--verify", "refs/stash"], env);
++  const previousSha = before.code === 0 ? before.stdout.trim() : "";
++  const stash = await git(
++    ["stash", "push", "--include-untracked", "--message", `tfs-developer-hub-reconcile-${operationId}`],
++    env,
++  );
++  if (stash.code !== 0) throw new Error(stash.stderr || "Failed to preserve local changes before fast-forward");
++
++  const after = await git(["rev-parse", "-q", "--verify", "refs/stash"], env);
++  const stashSha = after.code === 0 ? after.stdout.trim() : "";
++  if (!stashSha || stashSha === previousSha) {
++    throw new Error("Failed to create temporary reconciliation stash");
++  }
++  return stashSha;
++}
++
++async function applyTemporaryReconcileStash(stashSha: string, env: NodeJS.ProcessEnv): Promise<void> {
++  const apply = await git(["stash", "apply", "--index", stashSha], env);
++  if (apply.code !== 0) {
++    throw new Error(
++      apply.stderr ||
++        "Local changes could not be restored automatically after fast-forward; the operation will roll back",
++    );
++  }
++}
++
++async function dropTemporaryReconcileStash(stashSha: string, env?: NodeJS.ProcessEnv): Promise<void> {
++  const top = await git(["rev-parse", "-q", "--verify", "refs/stash"], env);
++  if (top.code !== 0 || top.stdout.trim() !== stashSha) return;
++  const drop = await git(["stash", "drop", "stash@{0}"], env);
++  if (drop.code !== 0) throw new Error(drop.stderr || "Failed to remove temporary reconciliation stash");
++}
++
+ async function runVerification(onLine: (line: string) => void) {
+@@ -855,4 +855,5 @@
+   let backupRoot = "";
+   let committed = false;
+   let remoteUpdated = false;
++  let temporaryStashSha = "";
+   try {
+@@ -885,10 +885,27 @@
+         await runVerification((line) => send("log", redactDeveloperHubOutput(line, config.token)));
+         await recordTimestampSafely("developerHub.lastPullAt", new Date().toISOString(), (message) => send("log", message));
+       } else {
+-        if (preview.mode === "sync" && exists && preview.behind > 0) {
++        const autoReconcile =
++          exists &&
++          preview.behind > 0 &&
++          (preview.mode === "sync" || (preview.mode === "push" && filesBefore.length > 0));
++
++        if (autoReconcile) {
++          if (filesBefore.length) {
++            temporaryStashSha = await createTemporaryReconcileStash(lock.id, env);
++            send("step", `Preserved ${filesBefore.length} local change(s) before fast-forward`);
++          }
++
+           await verifyRemoteTree(remoteRef, (line) => send("log", redactDeveloperHubOutput(line, config.token)));
+           const merge = await git(["merge", "--ff-only", remoteRef], env, (line) => send("log", redactDeveloperHubOutput(line, config.token)));
+           if (merge.code !== 0) throw new Error(redactDeveloperHubOutput(merge.stderr || "Fast-forward sync failed", config.token));
++
++          if (temporaryStashSha) {
++            await applyTemporaryReconcileStash(temporaryStashSha, env);
++            await dropTemporaryReconcileStash(temporaryStashSha, env);
++            temporaryStashSha = "";
++            send("step", "Local changes restored after fast-forward");
++          }
+         }
+ 
+         const firstPushSnapshot = !exists;
+@@ -967,5 +967,9 @@
+     try {
+       if (backupRoot && !remoteUpdated) {
+         await restoreWorkingTree(backupRoot, originalHead, originalHeadRef);
++        if (temporaryStashSha) {
++          await dropTemporaryReconcileStash(temporaryStashSha).catch(() => undefined);
++          temporaryStashSha = "";
++        }
+         await runVerification((line) => send("log", redactDeveloperHubOutput(line, config.token)));
+         rollbackStatus = "restored-and-rebuilt";
