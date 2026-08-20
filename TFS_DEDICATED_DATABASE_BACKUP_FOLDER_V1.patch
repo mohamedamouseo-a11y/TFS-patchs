@@ -1,0 +1,232 @@
+diff --git a/server/lib/tfs-backup-drive-folder.ts b/server/lib/tfs-backup-drive-folder.ts
+new file mode 100644
+--- /dev/null
++++ b/server/lib/tfs-backup-drive-folder.ts
+@@ -0,0 +1,94 @@
++const DRIVE_FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
++
++export const TFS_DATABASE_BACKUP_FOLDER_NAME = "TFS database backup";
++
++interface DriveFolder {
++  folderId: string;
++  folderName: string;
++  created: boolean;
++}
++
++function escapeDriveQueryLiteral(value: string): string {
++  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
++}
++
++async function readDriveError(res: Response): Promise<string> {
++  const text = await res.text();
++  return text || res.statusText || "Unknown Google Drive error";
++}
++
++export async function ensureTfsDatabaseBackupFolder(accessToken: string): Promise<DriveFolder> {
++  const escapedName = escapeDriveQueryLiteral(TFS_DATABASE_BACKUP_FOLDER_NAME);
++  const q = [
++    "'root' in parents",
++    `name = '${escapedName}'`,
++    `mimeType = '${DRIVE_FOLDER_MIME_TYPE}'`,
++    "trashed = false",
++  ].join(" and ");
++
++  const searchParams = new URLSearchParams({
++    q,
++    spaces: "drive",
++    corpora: "user",
++    pageSize: "10",
++    orderBy: "createdTime",
++    fields: "files(id,name,parents,driveId,shared)",
++  });
++  const searchRes = await fetch(
++    `https://www.googleapis.com/drive/v3/files?${searchParams.toString()}`,
++    { headers: { Authorization: `Bearer ${accessToken}` } },
++  );
++  if (!searchRes.ok) {
++    throw new Error(`Drive folder lookup failed (${searchRes.status}): ${await readDriveError(searchRes)}`);
++  }
++
++  const searchData = (await searchRes.json()) as {
++    files?: Array<{ id?: string; name?: string; driveId?: string; shared?: boolean }>;
++  };
++  const existing = (searchData.files ?? []).find((file) => file.id && !file.driveId && file.shared !== true);
++  if (existing?.id) {
++    return {
++      folderId: existing.id,
++      folderName: existing.name || TFS_DATABASE_BACKUP_FOLDER_NAME,
++      created: false,
++    };
++  }
++
++  const createRes = await fetch(
++    "https://www.googleapis.com/drive/v3/files?fields=id,name,parents,driveId,shared",
++    {
++      method: "POST",
++      headers: {
++        Authorization: `Bearer ${accessToken}`,
++        "Content-Type": "application/json",
++      },
++      body: JSON.stringify({
++        name: TFS_DATABASE_BACKUP_FOLDER_NAME,
++        mimeType: DRIVE_FOLDER_MIME_TYPE,
++        parents: ["root"],
++      }),
++    },
++  );
++  if (!createRes.ok) {
++    throw new Error(`Drive folder creation failed (${createRes.status}): ${await readDriveError(createRes)}`);
++  }
++
++  const created = (await createRes.json()) as {
++    id?: string;
++    name?: string;
++    driveId?: string;
++    shared?: boolean;
++  };
++  if (!created.id) {
++    throw new Error("Drive folder creation response missing folder id");
++  }
++  if (created.driveId || created.shared === true) {
++    throw new Error("Refusing to use a shared folder for TFS database backups");
++  }
++
++  return {
++    folderId: created.id,
++    folderName: created.name || TFS_DATABASE_BACKUP_FOLDER_NAME,
++    created: true,
++  };
++}
+diff --git a/server/routes/backup.ts b/server/routes/backup.ts
+--- a/server/routes/backup.ts
++++ b/server/routes/backup.ts
+@@ -11,8 +11,12 @@
+ import {
+   generateOAuthUrl,
+   exchangeOAuthCode,
+   getOAuthAccessToken,
+   testGoogleDriveConnection,
+   uploadFileToGoogleDrive,
+ } from "../lib/google-drive";
++import {
++  TFS_DATABASE_BACKUP_FOLDER_NAME,
++  ensureTfsDatabaseBackupFolder,
++} from "../lib/tfs-backup-drive-folder";
+ import { isPrimarySuperAdmin } from "../utils/primary-superadmin";
+@@ -68,9 +72,18 @@
+ async function getOAuthConfig(): Promise<{ clientId: string; clientSecret: string }> {
+   const dbClientId = await getSetting("backup.googleDriveClientId");
+   const dbClientSecret = await getSetting("backup.googleDriveClientSecret");
+   const clientId = dbClientId || env.GOOGLE_CLIENT_ID;
+   const clientSecret = dbClientSecret || env.GOOGLE_CLIENT_SECRET;
+   return { clientId, clientSecret };
+ }
+ 
++async function ensureDedicatedTfsBackupFolder(accessToken: string): Promise<string> {
++  const folder = await ensureTfsDatabaseBackupFolder(accessToken);
++  const currentFolderId = (await getSetting("backup.googleDriveFolderId")).trim();
++  if (currentFolderId !== folder.folderId) {
++    await upsertSetting("backup.googleDriveFolderId", folder.folderId);
++  }
++  return folder.folderId;
++}
++
+ function parseDatabaseUrl(rawUrl: string) {
+@@ -191,11 +204,11 @@
+     const driveEnabled = (await getSetting("backup.googleDriveEnabled")) === "true";
+     const driveRefreshToken = await getSetting("backup.googleDriveRefreshToken");
+-    const driveFolderId = await getSetting("backup.googleDriveFolderId");
+     const keepLatestLocalOnly = (await getSetting("backup.keepLatestLocalOnly")) === "true";
+ 
+     const oauthCfg = await getOAuthConfig();
+-    if (driveEnabled && driveRefreshToken && driveFolderId && oauthCfg.clientId && oauthCfg.clientSecret) {
++    if (driveEnabled && driveRefreshToken && oauthCfg.clientId && oauthCfg.clientSecret) {
+       step("Uploading to Google Drive...", 85);
+       try {
+         const accessToken = await getOAuthAccessToken(oauthCfg.clientId, oauthCfg.clientSecret, driveRefreshToken);
++        const driveFolderId = await ensureDedicatedTfsBackupFolder(accessToken);
+         const uploaded = await uploadFileToGoogleDrive(accessToken, filePath, fileName, driveFolderId);
+@@ -251,15 +264,14 @@
+ async function getSecureBackupDriveContext(): Promise<{ accessToken: string; folderId: string }> {
+   if (!databaseBackupEncryptionReady()) {
+     throw new Error("TFS_DB_BACKUP_ENCRYPTION_KEY is not configured or invalid");
+   }
+   const driveEnabled = (await getSetting("backup.googleDriveEnabled")) === "true";
+   const refreshToken = await getSetting("backup.googleDriveRefreshToken");
+-  const folderId = (await getSetting("backup.googleDriveFolderId")).trim();
+   const { clientId, clientSecret } = await getOAuthConfig();
+   if (!driveEnabled) throw new Error("Google Drive backup is not enabled");
+   if (!refreshToken) throw new Error("Google Drive is not connected");
+-  if (!folderId) throw new Error("Google Drive backup folder ID is not configured");
+   if (!clientId || !clientSecret) throw new Error("Google OAuth is not configured");
+   const accessToken = await getOAuthAccessToken(clientId, clientSecret, refreshToken);
++  const folderId = await ensureDedicatedTfsBackupFolder(accessToken);
+   return { accessToken, folderId };
+ }
+@@ -621,6 +633,8 @@
+   res.json({
+     enabled,
+     connected,
+     connectedEmail,
+     folderId,
++    folderName: TFS_DATABASE_BACKUP_FOLDER_NAME,
++    folderManaged: true,
+     keepLatestLocalOnly,
+@@ -668,10 +682,11 @@
+-    const { refreshToken, email } = await exchangeOAuthCode(
++    const { refreshToken, accessToken, email } = await exchangeOAuthCode(
+       cbClientId,
+       cbClientSecret,
+       code,
+       redirectUri
+     );
+     await upsertSetting("backup.googleDriveRefreshToken", refreshToken);
+     await upsertSetting("backup.googleDriveConnected", "true");
+     await upsertSetting("backup.googleDriveConnectedEmail", email ?? "");
++    await ensureDedicatedTfsBackupFolder(accessToken);
+     await upsertSetting("backup.lastDriveUploadError", "");
+@@ -685,16 +700,12 @@
+-// Save folder ID, upload enabled toggle, keepLatestLocalOnly
++// Save upload enabled toggle / local retention. The Drive folder is TFS-managed.
+ router.post("/backup/google-drive/settings", async (req: Request, res: Response) => {
+   const user = await getUserFromRequest(req);
+   if (!user) { res.status(401).json({ error: "Unauthorized" }); return; }
+   if (!isAdmin(user)) { res.status(403).json({ error: "Forbidden" }); return; }
+ 
+-  const { folderId, enabled, keepLatestLocalOnly } = req.body as {
+-    folderId?: string;
++  const { enabled, keepLatestLocalOnly } = req.body as {
+     enabled?: boolean;
+     keepLatestLocalOnly?: boolean;
+   };
+ 
+-  if (folderId !== undefined) {
+-    await upsertSetting("backup.googleDriveFolderId", folderId.trim());
+-  }
+   if (enabled !== undefined) {
+@@ -715,12 +726,7 @@
+   const refreshToken = await getSetting("backup.googleDriveRefreshToken");
+-  const folderId = await getSetting("backup.googleDriveFolderId");
+ 
+   if (!refreshToken) {
+     res.status(400).json({ error: "Google Drive is not connected. Click Connect Google Drive first." });
+     return;
+   }
+-  if (!folderId) {
+-    res.status(400).json({ error: "No Drive folder ID saved. Enter a folder ID and save settings first." });
+-    return;
+-  }
+   const { clientId: testClientId, clientSecret: testClientSecret } = await getOAuthConfig();
+@@ -732,5 +738,11 @@
+   try {
+     const accessToken = await getOAuthAccessToken(testClientId, testClientSecret, refreshToken);
++    const folderId = await ensureDedicatedTfsBackupFolder(accessToken);
+     await testGoogleDriveConnection(accessToken, folderId);
+-    res.json({ success: true, message: "Google Drive connection is working" });
++    res.json({
++      success: true,
++      message: "Google Drive connection is working",
++      folderId,
++      folderName: TFS_DATABASE_BACKUP_FOLDER_NAME,
++    });
+   } catch (e) {
